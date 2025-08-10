@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+
+IPSETS_DIR="/opt/ipsets"
+
+# Safe ipset reload process
+load_ipset_set() {
+    local set_name="$1"
+    local src_file="$2"
+    local set_name_tmp="${set_name}_tmp"
+
+    # Create SET_NAME if it does not exist
+    if ! sudo ipset list "$set_name" &>/dev/null; then
+        sudo ipset create "$set_name" hash:net family inet hashsize 1024 maxelem 65536
+    fi
+    # Remove temporary set (ignore errors)
+    sudo ipset destroy "$set_name_tmp" 2>/dev/null
+
+    # Extract only create/add lines for the ipset, replace SET_NAME with SET_NAME_TMP, and restore
+    grep -E "^(create|add) $set_name " "$src_file" | sed "s/$set_name/$set_name_tmp/g" | sudo ipset restore
+
+    # Update the main set by swap
+    sudo ipset swap "$set_name_tmp" "$set_name"
+
+    # Remove temporary set
+    sudo ipset destroy "$set_name_tmp"
+    echo "$set_name safely reloaded."
+}
+
+# Reload each ipset set from all files in IPSETS_DIR
+reload_ipsets_dir() {
+    shopt -s nullglob
+    TMP_RELOADED=$(mktemp)
+    for ipset_file in "$IPSETS_DIR"/*; do
+        basename_file=$(basename "$ipset_file")
+        # Skip files starting with __
+        [[ "$basename_file" == __* ]] && continue
+        grep '^create ' "$ipset_file" | awk '{print $2}' | while read set_name; do
+            load_ipset_set "$set_name" "$ipset_file"
+            echo "$set_name" >> "$TMP_RELOADED"
+        done
+    done
+    shopt -u nullglob
+
+    # Get the list of set names currently existing in ipset
+    current_sets=$(sudo ipset list -name)
+    for set in $current_sets; do
+        # Delete sets that were not reloaded
+        if ! grep -qx "$set" "$TMP_RELOADED"; then
+            sudo ipset destroy "$set"
+            echo "$set deleted from ipset."
+        fi
+    done
+    rm -f "$TMP_RELOADED"
+}
+
+# Load each ipset set from a specified file
+load_ipset_file() {
+    if [ -z "$1" ]; then
+        echo "Usage: $0 load-file <file_path>"
+        exit 1
+    fi
+    local ipset_file="$1"
+    if [ ! -f "$ipset_file" ]; then
+        echo "File not found: $ipset_file"
+        exit 1
+    fi
+    grep '^create ' "$ipset_file" | awk '{print $2}' | while read set_name; do
+        load_ipset_set "$set_name" "$ipset_file"
+    done
+}
+
+save_ipset() {
+    sudo mkdir -p "$IPSETS_DIR"
+
+    # Delete all files in $IPSETS_DIR except those containing '.' or starting with '__'
+    for file in "$IPSETS_DIR"/*; do
+        basename_file=$(basename "$file")
+        # Skip files containing '.' or starting with '__'
+        [[ "$basename_file" == *.* || "$basename_file" == __* ]] && continue
+        sudo rm -f "$file"
+    done
+
+    TMP_SAVE=$(mktemp)
+    sudo ipset save > "$TMP_SAVE"
+
+    # Extract list of ipset names
+    grep '^create ' "$TMP_SAVE" | awk '{print $2}' | while read SET_NAME; do
+        # Extract only create/add lines for the ipset
+        grep -E "^(create|add) $SET_NAME " "$TMP_SAVE" | sudo tee "$IPSETS_DIR/$SET_NAME" > /dev/null
+        echo "$SET_NAME saved to $IPSETS_DIR/$SET_NAME."
+    done
+
+    rm -f "$TMP_SAVE"
+}
+
+case "$1" in
+    reload)
+        reload_ipsets_dir
+        ;;
+    load-file)
+        shift
+        load_ipset_file "$@"
+        ;;
+    save)
+        save_ipset
+        ;;
+    *)
+        echo "Usage: $0 {reload|load-file|save}"
+        exit 1
+        ;;
+esac
